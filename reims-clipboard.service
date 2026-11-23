@@ -1,0 +1,12 @@
+[Unit]
+Description=Clipboard bridge between this desktop and the reims-ctl macOS VM (over SSH)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/reims-clipboard run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

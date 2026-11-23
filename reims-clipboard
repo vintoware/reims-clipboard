@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Keeps the host's clipboard (Wayland) and a macOS VM's clipboard in step, text only, over SSH.
+#
+#   reims-clipboard run    the bridge, in the foreground (the systemd user unit runs this)
+#   reims-clipboard push   internal: wl-paste --watch hands each host copy to this on stdin
+#
+# Host to guest: `wl-paste --watch` runs `push` on each copy, which pipes the text to the guest's
+# pbcopy. Guest to host: every POLL seconds the guest's clipboard is hashed (pbpaste | md5); on a
+# change the text is fetched and given to wl-copy. The hash of the last text synced, in either
+# direction, is kept in STATE, so a synced copy is not echoed back. Copies a KDE password manager
+# marks (x-kde-passwordManagerHint) stay on the host. One SSH connection is shared by every call
+# (ControlMaster). While the VM is down, polls fail quietly and are retried every 5 s, and a host
+# copy is skipped; on each (re)connection the host's clipboard is pushed, as a guest that just
+# booted has an empty one.
+#
+# env: REIMS_CLIP_HOST (127.0.0.1), REIMS_CLIP_PORT (10022), REIMS_CLIP_USER (user),
+#      REIMS_CLIP_KEY (~/.ssh/reims-macos), REIMS_CLIP_POLL (1)
+set -euo pipefail
+
+HOST=${REIMS_CLIP_HOST:-127.0.0.1}
+PORT=${REIMS_CLIP_PORT:-10022}
+GUEST_USER=${REIMS_CLIP_USER:-user}
+KEY=${REIMS_CLIP_KEY:-$HOME/.ssh/reims-macos}
+POLL=${REIMS_CLIP_POLL:-1}
+RUNTIME=${XDG_RUNTIME_DIR:?needs XDG_RUNTIME_DIR}/reims-clipboard
+STATE=$RUNTIME/last.md5
+# The guest's tools read and write UTF-8 only with a UTF-8 locale.
+GUEST_ENV='LANG=en_US.UTF-8 LC_CTYPE=en_US.UTF-8'
+
+die() { echo "reims-clipboard: $*" >&2; exit 2; }
+log() { echo "reims-clipboard: $*" >&2; }
+
+SSH=(ssh -p "$PORT" -i "$KEY" -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=3
+  -o ServerAliveInterval=5 -o ServerAliveCountMax=2
+  -o UserKnownHostsFile="$HOME/.ssh/reims-macos.known_hosts" -o StrictHostKeyChecking=accept-new
+  -o ControlMaster=auto -o ControlPath="$RUNTIME/ssh.sock" -o ControlPersist=60
+  "$GUEST_USER@$HOST")
+
+last() { cat "$STATE" 2> /dev/null || true; }
+remember() { printf '%s\n' "$1" > "$STATE.tmp" && mv -f "$STATE.tmp" "$STATE"; }
+
+push() {
+  local tmp sum
+  # A password manager's copy stays on the host.
+  if wl-paste --list-types 2> /dev/null | grep -qx 'x-kde-passwordManagerHint'; then
+    cat > /dev/null
+    return 0
+  fi
+  tmp=$(mktemp "$RUNTIME/push.XXXXXX")
+  cat > "$tmp"
+  if [[ -s $tmp ]]; then
+    sum=$(md5sum < "$tmp" | cut -d' ' -f1)
+    if [[ $sum != "$(last)" ]] && "${SSH[@]}" "$GUEST_ENV pbcopy" < "$tmp" 2> /dev/null; then
+      remember "$sum"
+    fi
+  fi
+  rm -f "$tmp"
+}
+
+run() {
+  for t in ssh wl-paste wl-copy md5sum; do command -v "$t" > /dev/null || die "needs $t"; done
+  [[ -r $KEY ]] || die "no SSH key at $KEY"
+  [[ -n ${WAYLAND_DISPLAY:-} ]] || die "no WAYLAND_DISPLAY: run it in the desktop session"
+  mkdir -p "$RUNTIME"
+  chmod 700 "$RUNTIME"
+  wl-paste --type text --watch "$0" push &
+  watcher=$!
+  local up=0 sum
+  # systemd stops every process of the unit at once, so the watcher and the SSH master may already
+  # be gone here: their cleanup must not fail the exit under set -e.
+  trap 'kill "$watcher" 2> /dev/null || true; "${SSH[@]}" -O exit 2> /dev/null || true; exit 0' INT TERM
+  trap 'kill "$watcher" 2> /dev/null || true' EXIT
+  log "bridging the clipboard with $GUEST_USER@$HOST:$PORT"
+  while kill -0 "$watcher" 2> /dev/null; do
+    if sum=$("${SSH[@]}" "$GUEST_ENV pbpaste | md5" 2> /dev/null); then
+      if ((!up)); then
+        log "connected"
+        up=1
+        # The guest may have rebooted since the last sync: forget it, and give it the host's text.
+        rm -f "$STATE"
+        wl-paste --no-newline --type text 2> /dev/null | push || true
+        sum=$("${SSH[@]}" "$GUEST_ENV pbpaste | md5" 2> /dev/null) || continue
+      fi
+      # md5 of an empty clipboard: nothing to give the host.
+      if [[ $sum != d41d8cd98f00b204e9800998ecf8427e && $sum != "$(last)" ]]; then
+        # Remembered before wl-copy, whose copy wakes the watcher at once: its push then
+        # finds the text already synced and sends nothing back.
+        local tmp
+        tmp=$(mktemp "$RUNTIME/pull.XXXXXX")
+        if "${SSH[@]}" "$GUEST_ENV pbpaste" > "$tmp" 2> /dev/null && [[ -s $tmp ]]; then
+          remember "$(md5sum < "$tmp" | cut -d' ' -f1)"
+          wl-copy < "$tmp"
+        fi
+        rm -f "$tmp"
+      fi
+      sleep "$POLL"
+    else
+      ((!up)) || { log "guest unreachable; retrying"; up=0; }
+      sleep 5
+    fi
+  done
+  die "wl-paste --watch ended"
+}
+
+case ${1:-} in
+run) run ;;
+push) push ;;
+*) sed -n '2,15p' "$0" >&2; exit 2 ;;
+esac
